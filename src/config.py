@@ -122,6 +122,27 @@ class BotConfig:
     rfq_response_deadline_s: float = field(
         default_factory=lambda: _env_float("RFQ_RESPONSE_DEADLINE_S", 0.75)
     )
+    # Caps how many RFQs are processed concurrently -- real peak HTTP concurrency is roughly
+    # this value x (legs per combo), since each RFQ fetches one orderbook per leg. Without this
+    # cap, a burst (e.g. a WS backlog replay on fresh subscription -- observed firsthand: 600+
+    # at once) fans out into hundreds of concurrent HTTP requests and can exhaust the connection
+    # pool, causing self-inflicted timeouts on requests that would otherwise have succeeded.
+    max_concurrent_rfq_processing: int = field(
+        default_factory=lambda: _env_int("RFQ_MAX_CONCURRENT_PROCESSING", 20)
+    )
+    # Caps outbound REST requests/second to Kalshi, as two independent buckets matching
+    # Kalshi's actual rate-limit model (docs.kalshi.com/getting_started/rate_limits): a bigger
+    # connection pool alone just shifts a burst's failure mode from "blocked on our own pool"
+    # to "429 from Kalshi's server-side limit" (both observed firsthand). Confirmed tiers:
+    # Basic 200/100 tokens/sec, Advanced (free, auto-upgraded at startup) 300/300, most
+    # requests cost 10 tokens. These defaults sit at 80% of Advanced's ~30 req/s, and are
+    # safely under Basic too in case the upgrade call ever fails.
+    max_read_requests_per_second: float = field(
+        default_factory=lambda: _env_float("RFQ_MAX_READ_REQUESTS_PER_SECOND", 24.0)
+    )
+    max_write_requests_per_second: float = field(
+        default_factory=lambda: _env_float("RFQ_MAX_WRITE_REQUESTS_PER_SECOND", 24.0)
+    )
     # How long to wait for a `quote_accepted` event before giving up on a submitted quote and
     # releasing its reserved liability. This is a safety-net timeout, not the exchange's own
     # confirmation window (which is a much shorter 3-30s, starts only after acceptance, and is
@@ -144,3 +165,8 @@ class BotConfig:
     # reconciliation failure, prolonged WS outage, repeated fill-check failures). None disables
     # alerting entirely -- it's a convenience layer, never a hard dependency.
     alert_webhook_url: Optional[str] = field(default_factory=lambda: _env_str("RFQ_ALERT_WEBHOOK_URL", None))
+    # Local, read-only web dashboard for watching activity live. Binds to localhost only by
+    # default -- it exposes real trading activity and bankroll figures, so don't widen this
+    # without understanding who else is on the network.
+    dashboard_host: str = field(default_factory=lambda: _env_str("RFQ_DASHBOARD_HOST", "127.0.0.1"))
+    dashboard_port: int = field(default_factory=lambda: _env_int("RFQ_DASHBOARD_PORT", 8765))

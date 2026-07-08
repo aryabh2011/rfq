@@ -31,7 +31,9 @@ from dataclasses import dataclass
 
 import websockets
 
+from src.activity_feed import ActivityFeed
 from src.config import BotConfig, KalshiConfig
+from src.dashboard_server import DashboardServer
 from src.execution.rfq_anchor_engine import MinimalistPennyingEngine
 from src.execution.rfq_risk_gate import RFQInventoryManager, contract_liability, legs_share_event
 from src.kalshi_client import (
@@ -93,8 +95,14 @@ class BankrollTracker:
 
 class RFQBot:
     def __init__(self, kalshi_config: KalshiConfig, bot_config: BotConfig) -> None:
-        self._http = KalshiHttpClient(kalshi_config)
+        self._demo_mode = kalshi_config.demo_mode
+        self._http = KalshiHttpClient(
+            kalshi_config,
+            max_read_requests_per_second=bot_config.max_read_requests_per_second,
+            max_write_requests_per_second=bot_config.max_write_requests_per_second,
+        )
         self._ws_client = KalshiWebSocketClient(kalshi_config)
+        self._feed = ActivityFeed()
         self._engine = MinimalistPennyingEngine(
             fee_buffer=bot_config.fee_buffer,
             fee_buffer_per_extra_leg=bot_config.fee_buffer_per_extra_leg,
@@ -111,6 +119,9 @@ class RFQBot:
             min_notional_cap_per_prefix_usd=bot_config.min_notional_cap_per_prefix_usd,
         )
         self._notifier = Notifier(bot_config.alert_webhook_url)
+        self._dashboard = DashboardServer(
+            self._feed, self._get_state_snapshot, host=bot_config.dashboard_host, port=bot_config.dashboard_port
+        )
         self._response_deadline_s = bot_config.rfq_response_deadline_s
         self._quote_acceptance_timeout_s = bot_config.quote_acceptance_timeout_s
         self._seen_rfq_ttl_s = bot_config.seen_rfq_ttl_s
@@ -121,9 +132,29 @@ class RFQBot:
         self._stopping = False
         self._seen_rfq_ids: dict[str, float] = {}
         self._pending_quotes: dict[str, PendingQuote] = {}
+        # Bounds how many RFQs are processed concurrently -- NOT the same as the number of
+        # concurrent HTTP calls, since each RFQ fires one orderbook fetch per leg: real peak
+        # concurrency is roughly (this value) x (legs per combo). Without this cap, a burst of
+        # RFQs (e.g. a WS backlog replay on fresh subscription -- seen firsthand: 600+ at once)
+        # fans out into hundreds of concurrent HTTP requests, which can exhaust the connection
+        # pool and cause self-inflicted timeouts even on requests that would otherwise have
+        # succeeded well within the deadline.
+        self._rfq_semaphore = asyncio.Semaphore(bot_config.max_concurrent_rfq_processing)
 
     def stop(self) -> None:
         self._stopping = True
+
+    def _get_state_snapshot(self) -> dict:
+        """Read-only snapshot for the dashboard's /state endpoint."""
+        liabilities = self._risk_gate.liability_snapshot()
+        return {
+            "mode": "DEMO" if self._demo_mode else "LIVE",
+            "bankroll_usd": self._bankroll.value,
+            "halted": self._halted,
+            "total_reserved_liability": sum(liabilities.values()),
+            "open_ticker_count": len(liabilities),
+            "pending_quotes": len(self._pending_quotes),
+        }
 
     async def _reconcile_startup_liability(self) -> None:
         """Seed the risk gate from live positions before accepting any RFQs.
@@ -137,6 +168,7 @@ class RFQBot:
             await self._notifier.notify(
                 "RFQ bot STARTUP FAILED: could not fetch live positions for reconciliation. Refusing to start."
             )
+            self._feed.publish("reconciliation_failed", reason="could not fetch live positions")
             raise StartupReconciliationError("Could not fetch live positions for startup reconciliation.") from exc
 
         liabilities, fully_parsed = extract_position_liabilities(positions)
@@ -145,6 +177,7 @@ class RFQBot:
                 "RFQ bot STARTUP FAILED: one or more open positions had an unparseable exposure "
                 "field during reconciliation. Refusing to start until this is resolved manually."
             )
+            self._feed.publish("reconciliation_failed", reason="unparseable position record")
             raise StartupReconciliationError(
                 "One or more open positions could not be confidently parsed during startup "
                 "reconciliation -- refusing to start rather than assume zero existing exposure."
@@ -155,48 +188,67 @@ class RFQBot:
             "Startup reconciliation complete: seeded risk gate with $%.2f of real liability across %d tickers.",
             sum(liabilities.values()), len(liabilities),
         )
+        self._feed.publish(
+            "reconciliation_complete", total_liability=sum(liabilities.values()), ticker_count=len(liabilities)
+        )
+
+    async def _upgrade_api_tier_best_effort(self) -> None:
+        """Raise our own rate-limit tier to Advanced (free, no approval, confirmed idempotent).
+        Never blocks or fails startup -- if this errors, we keep whatever tier the account is
+        already on and rely on the rate limiter's conservative (Basic-tier-safe) defaults.
+        """
+        try:
+            await self._http.upgrade_api_usage_level()
+            logger.info("Requested API usage tier upgrade (Advanced) -- best-effort, idempotent.")
+        except Exception:
+            logger.warning("Could not upgrade API usage tier (non-fatal, continuing).", exc_info=True)
 
     async def run(self) -> None:
+        await self._dashboard.start()
         try:
-            await self._reconcile_startup_liability()
-
-            background_tasks = [
-                asyncio.create_task(self._bankroll.run()),
-                asyncio.create_task(self._prune_seen_rfq_ids()),
-            ]
             try:
-                backoff_s = 1.0
-                ws_outage_alert_fired = False
-                while not self._stopping:
-                    try:
-                        ws = await self._ws_client.connect()
-                        backoff_s = 1.0
-                        ws_outage_alert_fired = False
+                await self._upgrade_api_tier_best_effort()
+                await self._reconcile_startup_liability()
+
+                background_tasks = [
+                    asyncio.create_task(self._bankroll.run()),
+                    asyncio.create_task(self._prune_seen_rfq_ids()),
+                ]
+                try:
+                    backoff_s = 1.0
+                    ws_outage_alert_fired = False
+                    while not self._stopping:
                         try:
-                            async for event in self._ws_client.stream_events(ws):
-                                self._dispatch(event)
-                        finally:
-                            await ws.close()
-                    except (websockets.exceptions.WebSocketException, OSError) as exc:
-                        if self._stopping:
-                            break
-                        logger.warning("WS connection lost (%s); reconnecting in %.1fs.", exc, backoff_s)
-                        if backoff_s >= MAX_RECONNECT_BACKOFF_S and not ws_outage_alert_fired:
-                            ws_outage_alert_fired = True
-                            await self._notifier.notify(
-                                f"RFQ bot: WS reconnect backoff has maxed out ({exc}); "
-                                "the bot has been unable to reconnect for a while."
-                            )
-                        await asyncio.sleep(backoff_s)
-                        backoff_s = min(backoff_s * 2, MAX_RECONNECT_BACKOFF_S)
+                            ws = await self._ws_client.connect()
+                            backoff_s = 1.0
+                            ws_outage_alert_fired = False
+                            try:
+                                async for event in self._ws_client.stream_events(ws):
+                                    self._dispatch(event)
+                            finally:
+                                await ws.close()
+                        except (websockets.exceptions.WebSocketException, OSError) as exc:
+                            if self._stopping:
+                                break
+                            logger.warning("WS connection lost (%s); reconnecting in %.1fs.", exc, backoff_s)
+                            if backoff_s >= MAX_RECONNECT_BACKOFF_S and not ws_outage_alert_fired:
+                                ws_outage_alert_fired = True
+                                await self._notifier.notify(
+                                    f"RFQ bot: WS reconnect backoff has maxed out ({exc}); "
+                                    "the bot has been unable to reconnect for a while."
+                                )
+                            await asyncio.sleep(backoff_s)
+                            backoff_s = min(backoff_s * 2, MAX_RECONNECT_BACKOFF_S)
+                finally:
+                    for task in background_tasks:
+                        task.cancel()
+                    for task in background_tasks:
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
             finally:
-                for task in background_tasks:
-                    task.cancel()
-                for task in background_tasks:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                await self._http.aclose()
         finally:
-            await self._http.aclose()
+            await self._dashboard.stop()
 
     def _dispatch(self, event) -> None:
         if isinstance(event, RFQBroadcast):
@@ -236,17 +288,25 @@ class RFQBot:
                 f"RFQ bot STOP-LOSS TRIGGERED: cash balance ${self._bankroll.value:.2f} <= "
                 f"floor ${self._stop_loss_floor_usd:.2f}. All new quoting halted; restart to resume."
             )
+            self._feed.publish(
+                "stop_loss_triggered", bankroll_usd=self._bankroll.value, floor_usd=self._stop_loss_floor_usd
+            )
             return
 
-        try:
-            await asyncio.wait_for(self._process_rfq(event), timeout=self._response_deadline_s)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Skipping RFQ %s: exceeded %.2fs response deadline (network latency).",
-                event.rfq_id, self._response_deadline_s,
-            )
-        except Exception:
-            logger.exception("Skipping RFQ %s: unhandled error while processing.", event.rfq_id)
+        # Acquire before starting the deadline clock: queueing behind the concurrency cap
+        # shouldn't itself eat into an RFQ's response window once it actually gets a turn.
+        async with self._rfq_semaphore:
+            try:
+                await asyncio.wait_for(self._process_rfq(event), timeout=self._response_deadline_s)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Skipping RFQ %s: exceeded %.2fs response deadline (network latency).",
+                    event.rfq_id, self._response_deadline_s,
+                )
+                self._feed.publish("rfq_skipped", rfq_id=event.rfq_id, reason="exceeded response deadline")
+            except Exception:
+                logger.exception("Skipping RFQ %s: unhandled error while processing.", event.rfq_id)
+                self._feed.publish("rfq_skipped", rfq_id=event.rfq_id, reason="unhandled error")
 
     async def _process_rfq(self, event: RFQBroadcast) -> None:
         if self._mgp_only and legs_share_event(event.leg_tickers):
@@ -256,6 +316,7 @@ class RFQBot:
                 "violate the pricing engine's independence assumption.",
                 event.rfq_id,
             )
+            self._feed.publish("rfq_skipped", rfq_id=event.rfq_id, reason="same-event combo (SGP), MGP-only mode")
             return
 
         books = await asyncio.gather(
@@ -267,11 +328,13 @@ class RFQBot:
                 "Skipping RFQ %s: a leg has no tradeable market (empty/crossed/too-thin book).",
                 event.rfq_id,
             )
+            self._feed.publish("rfq_skipped", rfq_id=event.rfq_id, reason="a leg has no tradeable market")
             return
 
         quote = self._engine.calculate_anchored_quote(leg_vwmids)
         if quote is None:
             logger.info("Skipping RFQ %s: no safe two-sided quote (margin swallows the estimate).", event.rfq_id)
+            self._feed.publish("rfq_skipped", rfq_id=event.rfq_id, reason="no safe two-sided quote")
             return
         yes_bid, no_bid = quote
 
@@ -284,6 +347,7 @@ class RFQBot:
 
         if yes_contracts <= 0 and no_contracts <= 0:
             logger.info("Skipping RFQ %s: no priceable side has any contracts to offer.", event.rfq_id)
+            self._feed.publish("rfq_skipped", rfq_id=event.rfq_id, reason="no priceable side has contracts to offer")
             return
 
         yes_liability = contract_liability(yes_bid, yes_contracts) if yes_bid > 0 else 0.0
@@ -293,6 +357,7 @@ class RFQBot:
         approved = await self._risk_gate.try_reserve(event.market_ticker, worst_case_liability)
         if not approved:
             logger.warning("Skipping RFQ %s: rejected by inventory risk gate (exposure limit).", event.rfq_id)
+            self._feed.publish("rfq_skipped", rfq_id=event.rfq_id, reason="rejected by inventory risk gate")
             return
 
         try:
@@ -314,6 +379,11 @@ class RFQBot:
             "Quoted RFQ %s: %s yes_bid=%.2f(x%.2f) no_bid=%.2f(x%.2f), worst-case liability $%.2f reserved.",
             event.rfq_id, event.market_ticker, yes_bid, yes_contracts, no_bid, no_contracts, worst_case_liability,
         )
+        self._feed.publish(
+            "rfq_quoted", rfq_id=event.rfq_id, market_ticker=event.market_ticker,
+            yes_bid=yes_bid, no_bid=no_bid, yes_contracts=yes_contracts, no_contracts=no_contracts,
+            worst_case_liability=worst_case_liability,
+        )
         asyncio.create_task(self._expire_if_not_accepted(quote_id))
 
     async def _expire_if_not_accepted(self, quote_id: str) -> None:
@@ -327,6 +397,9 @@ class RFQBot:
             quote_id, pending.rfq_id, self._quote_acceptance_timeout_s,
         )
         self._risk_gate.release(pending.market_ticker, pending.worst_case_liability)
+        self._feed.publish(
+            "quote_expired", quote_id=quote_id, rfq_id=pending.rfq_id, liability_released=pending.worst_case_liability
+        )
 
     async def _handle_quote_accepted(self, event: QuoteAccepted) -> None:
         pending = self._pending_quotes.get(event.quote_id)
@@ -354,6 +427,7 @@ class RFQBot:
             await self._notifier.notify(
                 f"RFQ bot: failed to confirm accepted quote {event.quote_id} in time -- trade likely lost."
             )
+            self._feed.publish("quote_confirm_failed", quote_id=event.quote_id, rfq_id=event.rfq_id)
             return
 
         accepted_price = pending.yes_bid if event.accepted_side == "yes" else pending.no_bid
@@ -368,6 +442,10 @@ class RFQBot:
             "Confirmed quote %s (RFQ %s): accepted_side=%s contracts=%.2f, real liability $%.2f.",
             event.quote_id, event.rfq_id, event.accepted_side, event.contracts_accepted, actual_liability,
         )
+        self._feed.publish(
+            "quote_confirmed", quote_id=event.quote_id, rfq_id=event.rfq_id,
+            accepted_side=event.accepted_side, contracts=event.contracts_accepted, liability=actual_liability,
+        )
 
     async def _handle_quote_executed(self, event: QuoteExecuted) -> None:
         pending = self._pending_quotes.pop(event.quote_id, None)
@@ -375,6 +453,10 @@ class RFQBot:
             logger.info(
                 "RFQ %s quote %s executed as order %s; $%.2f liability is now a confirmed real position.",
                 event.rfq_id, event.quote_id, event.order_id, pending.worst_case_liability,
+            )
+            self._feed.publish(
+                "quote_executed", quote_id=event.quote_id, rfq_id=event.rfq_id,
+                order_id=event.order_id, liability=pending.worst_case_liability,
             )
 
 

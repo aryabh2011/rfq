@@ -1,0 +1,217 @@
+<title>RFQ Bot Dashboard</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0b0d12;
+    --panel: #131722;
+    --border: #232838;
+    --text: #e7e9ee;
+    --muted: #8b93a7;
+    --accent: #4f8cff;
+    --green: #35c281;
+    --red: #ef5b5b;
+    --amber: #e0a940;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f5f8;
+      --panel: #ffffff;
+      --border: #e2e4ea;
+      --text: #14161c;
+      --muted: #5c6270;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0;
+    flex: 1;
+  }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .badge-live { background: rgba(239,91,91,0.15); color: var(--red); }
+  .badge-demo { background: rgba(53,194,129,0.15); color: var(--green); }
+  .halted-banner {
+    display: none;
+    background: rgba(239,91,91,0.15);
+    color: var(--red);
+    padding: 10px 20px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+  }
+  .halted-banner.show { display: block; }
+  main { max-width: 980px; margin: 0 auto; padding: 20px; }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .stat .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .stat .value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .feed {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .feed-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .event {
+    display: flex;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    align-items: baseline;
+  }
+  .event:last-child { border-bottom: none; }
+  .event .time { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .event .tag {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 6px;
+    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .tag-skipped { background: rgba(139,147,167,0.15); color: var(--muted); }
+  .tag-quoted { background: rgba(79,140,255,0.15); color: var(--accent); }
+  .tag-confirmed, .tag-executed { background: rgba(53,194,129,0.15); color: var(--green); }
+  .tag-expired, .tag-failed { background: rgba(224,169,64,0.15); color: var(--amber); }
+  .tag-stoploss { background: rgba(239,91,91,0.15); color: var(--red); }
+  .event .desc { flex: 1; }
+  .empty { padding: 30px 16px; text-align: center; color: var(--muted); font-size: 13px; }
+</style>
+
+<div class="halted-banner" id="halted-banner">HALTED -- stop-loss triggered. No new quoting until restart.</div>
+<header>
+  <h1>RFQ Bot</h1>
+  <span class="badge" id="mode-badge">--</span>
+</header>
+<main>
+  <div class="stats">
+    <div class="stat"><div class="label">Bankroll</div><div class="value" id="stat-bankroll">--</div></div>
+    <div class="stat"><div class="label">Reserved liability</div><div class="value" id="stat-liability">--</div></div>
+    <div class="stat"><div class="label">Pending quotes</div><div class="value" id="stat-pending">--</div></div>
+    <div class="stat"><div class="label">Open tickers</div><div class="value" id="stat-tickers">--</div></div>
+  </div>
+  <div class="feed">
+    <div class="feed-header">Live activity</div>
+    <div id="feed-body"><div class="empty">Waiting for activity...</div></div>
+  </div>
+</main>
+
+<script>
+const fmtUsd = (n) => "$" + Number(n ?? 0).toFixed(2);
+const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString();
+
+function describe(ev) {
+  switch (ev.type) {
+    case "rfq_skipped":
+      return { tag: "skipped", text: `Skipped RFQ ${short(ev.rfq_id)}: ${ev.reason}` };
+    case "rfq_quoted":
+      return {
+        tag: "quoted",
+        text: `Quoted ${ev.market_ticker}: yes_bid=${ev.yes_bid.toFixed(2)}(x${ev.yes_contracts.toFixed(2)}) `
+            + `no_bid=${ev.no_bid.toFixed(2)}(x${ev.no_contracts.toFixed(2)}), worst-case ${fmtUsd(ev.worst_case_liability)} reserved`,
+      };
+    case "quote_confirmed":
+      return { tag: "confirmed", text: `Confirmed quote ${short(ev.quote_id)}: accepted_side=${ev.accepted_side} `
+            + `contracts=${ev.contracts.toFixed(2)}, real liability ${fmtUsd(ev.liability)}` };
+    case "quote_confirm_failed":
+      return { tag: "failed", text: `Failed to confirm quote ${short(ev.quote_id)} in time -- trade likely lost` };
+    case "quote_executed":
+      return { tag: "executed", text: `Executed: order ${short(ev.order_id)}, ${fmtUsd(ev.liability)} now a confirmed position` };
+    case "quote_expired":
+      return { tag: "expired", text: `Quote ${short(ev.quote_id)} not accepted in time; released ${fmtUsd(ev.liability_released)}` };
+    case "stop_loss_triggered":
+      return { tag: "stoploss", text: `STOP-LOSS: bankroll ${fmtUsd(ev.bankroll_usd)} <= floor ${fmtUsd(ev.floor_usd)}` };
+    case "reconciliation_complete":
+      return { tag: "confirmed", text: `Startup reconciliation: ${fmtUsd(ev.total_liability)} across ${ev.ticker_count} tickers` };
+    case "reconciliation_failed":
+      return { tag: "failed", text: `Startup reconciliation FAILED: ${ev.reason}` };
+    default:
+      return { tag: "skipped", text: JSON.stringify(ev) };
+  }
+}
+
+function short(id) { return id ? String(id).slice(0, 8) : "?"; }
+
+const feedBody = document.getElementById("feed-body");
+let renderedAny = false;
+
+function prependEvent(ev) {
+  if (!renderedAny) {
+    feedBody.innerHTML = "";
+    renderedAny = true;
+  }
+  const { tag, text } = describe(ev);
+  const row = document.createElement("div");
+  row.className = "event";
+  row.innerHTML = `<span class="time">${fmtTime(ev.ts)}</span>`
+      + `<span class="tag tag-${tag}">${tag}</span>`
+      + `<span class="desc"></span>`;
+  row.querySelector(".desc").textContent = text;
+  feedBody.insertBefore(row, feedBody.firstChild);
+  while (feedBody.children.length > 300) {
+    feedBody.removeChild(feedBody.lastChild);
+  }
+}
+
+async function refreshState() {
+  try {
+    const res = await fetch("/state");
+    const state = await res.json();
+    document.getElementById("mode-badge").textContent = state.mode;
+    document.getElementById("mode-badge").className = "badge badge-" + state.mode.toLowerCase();
+    document.getElementById("stat-bankroll").textContent = fmtUsd(state.bankroll_usd);
+    document.getElementById("stat-liability").textContent = fmtUsd(state.total_reserved_liability);
+    document.getElementById("stat-pending").textContent = state.pending_quotes;
+    document.getElementById("stat-tickers").textContent = state.open_ticker_count;
+    document.getElementById("halted-banner").classList.toggle("show", state.halted);
+  } catch (e) {
+    // dashboard polling failure is not actionable by the viewer; just retry next tick
+  }
+}
+
+refreshState();
+setInterval(refreshState, 5000);
+
+const source = new EventSource("/events");
+source.onmessage = (msg) => prependEvent(JSON.parse(msg.data));
+</script>

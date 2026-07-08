@@ -149,3 +149,7 @@ class RFQInventoryManager:
             "Risk gate seeded with $%.2f of real liability across %d tickers (%d prefixes).",
             sum(liability_by_ticker.values()), len(liability_by_ticker), len(self._liability_by_prefix),
         )
+
+    def liability_snapshot(self) -> Dict[str, float]:
+        """Read-only copy of current liability by ticker, e.g. for a monitoring dashboard."""
+        return dict(self._liability_by_ticker)

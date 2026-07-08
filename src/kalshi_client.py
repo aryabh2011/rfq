@@ -23,6 +23,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from src.config import KalshiConfig
+from src.rate_limiter import TokenBucketRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -171,10 +172,34 @@ def extract_position_liabilities(positions: List[dict]) -> Tuple[Dict[str, float
 class KalshiHttpClient:
     """Signed REST access for orderbook reads and RFQ quote lifecycle actions."""
 
-    def __init__(self, config: KalshiConfig, timeout_s: float = 2.0) -> None:
+    def __init__(
+        self,
+        config: KalshiConfig,
+        timeout_s: float = 2.0,
+        max_connections: int = 200,
+        max_keepalive_connections: int = 50,
+        max_read_requests_per_second: float = 24.0,
+        max_write_requests_per_second: float = 24.0,
+    ) -> None:
+        # httpx's default pool (100 connections) can be exhausted by a burst of RFQs each
+        # firing 1-2 concurrent orderbook fetches -- observed directly: a WS backlog replay
+        # of 600+ RFQs on fresh subscription caused real ConnectTimeouts waiting for a pool
+        # slot. Raised generously here as a second line of defense; the primary defense is
+        # the rate limiters below, since a bigger pool alone just shifts the failure from our
+        # own ConnectTimeout to a 429 from Kalshi's server-side rate limit (also observed).
+        #
+        # Kalshi's rate limits are two independent token buckets (read/write), confirmed via
+        # docs.kalshi.com/getting_started/rate_limits: Basic tier is 200/100 tokens/sec,
+        # Advanced (free, one API call, no approval -- see upgrade_api_usage_level) is
+        # 300/300. Most requests cost 10 tokens, so that's ~30 req/s each on Advanced; these
+        # defaults sit at 80% of that as a safety margin, and are safely under Basic tier too
+        # in case the upgrade call ever fails.
         self._config = config
         self._private_key = _load_private_key(config.private_key_path)
-        self._client = httpx.AsyncClient(base_url=config.rest_host, timeout=timeout_s)
+        limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_keepalive_connections)
+        self._client = httpx.AsyncClient(base_url=config.rest_host, timeout=timeout_s, limits=limits)
+        self._read_rate_limiter = TokenBucketRateLimiter(max_read_requests_per_second)
+        self._write_rate_limiter = TokenBucketRateLimiter(max_write_requests_per_second)
 
     def _path(self, suffix: str) -> str:
         return self._config.rest_path_prefix + suffix
@@ -188,10 +213,33 @@ class KalshiHttpClient:
             "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
         }
 
+    @staticmethod
+    def _warn_if_rate_limited(response: httpx.Response) -> None:
+        if response.status_code == 429:
+            logger.warning("Rate limited by Kalshi (429) on %s %s", response.request.method, response.request.url)
+
+    async def _get(self, path: str, headers: dict, params: Optional[dict] = None) -> httpx.Response:
+        await self._read_rate_limiter.acquire()
+        response = await self._client.get(path, params=params, headers=headers)
+        self._warn_if_rate_limited(response)
+        return response
+
+    async def _post(self, path: str, json_body: dict, headers: dict) -> httpx.Response:
+        await self._write_rate_limiter.acquire()
+        response = await self._client.post(path, json=json_body, headers=headers)
+        self._warn_if_rate_limited(response)
+        return response
+
+    async def _put(self, path: str, json_body: dict, headers: dict) -> httpx.Response:
+        await self._write_rate_limiter.acquire()
+        response = await self._client.put(path, json=json_body, headers=headers)
+        self._warn_if_rate_limited(response)
+        return response
+
     async def get_orderbook(self, ticker: str, depth: int = 10) -> OrderbookSnapshot:
         path = self._path(f"/markets/{ticker}/orderbook")
         headers = self._auth_headers("GET", path)
-        response = await self._client.get(path, params={"depth": depth}, headers=headers)
+        response = await self._get(path, headers, params={"depth": depth})
         response.raise_for_status()
         book = response.json().get("orderbook_fp") or {}
         return OrderbookSnapshot(
@@ -224,7 +272,7 @@ class KalshiHttpClient:
             "rest_remainder": False,
         }
         headers = self._auth_headers("POST", path)
-        response = await self._client.post(path, json=body, headers=headers)
+        response = await self._post(path, body, headers)
         response.raise_for_status()
         return response.json()["id"]
 
@@ -233,14 +281,25 @@ class KalshiHttpClient:
         window (3-30s depending on market volatility) or the acceptance is voided."""
         path = self._path(f"/communications/rfqs/{rfq_id}/quotes/{quote_id}/confirm")
         headers = self._auth_headers("PUT", path)
-        response = await self._client.put(path, json={}, headers=headers)
+        response = await self._put(path, {}, headers)
+        response.raise_for_status()
+
+    async def upgrade_api_usage_level(self) -> None:
+        """Upgrade to the Advanced API rate-limit tier (300/300 read/write tokens-per-sec vs
+        Basic's 200/100) -- free, no approval needed, and confirmed idempotent (calling it
+        again when already at or above Advanced just succeeds again with no error). Safe to
+        call unconditionally on every startup rather than tracking whether it's needed.
+        """
+        path = self._path("/account/api_usage_level/upgrade")
+        headers = self._auth_headers("POST", path)
+        response = await self._post(path, {}, headers)
         response.raise_for_status()
 
     async def get_balance_usd(self) -> float:
         """Live settled cash balance, in dollars. Used to size risk caps and drive the stop-loss halt."""
         path = self._path("/portfolio/balance")
         headers = self._auth_headers("GET", path)
-        response = await self._client.get(path, headers=headers)
+        response = await self._get(path, headers)
         response.raise_for_status()
         return response.json()["balance"] / 100.0
 
@@ -248,7 +307,7 @@ class KalshiHttpClient:
         """Open market positions. Used for startup reconciliation against real, live exposure."""
         path = self._path("/portfolio/positions")
         headers = self._auth_headers("GET", path)
-        response = await self._client.get(path, headers=headers)
+        response = await self._get(path, headers)
         response.raise_for_status()
         body = response.json()
         return body.get("market_positions") or body.get("positions") or []
@@ -260,7 +319,7 @@ class KalshiHttpClient:
         """
         path = self._path("/portfolio/fills")
         headers = self._auth_headers("GET", path)
-        response = await self._client.get(path, params={"ticker": ticker, "min_ts": min_ts}, headers=headers)
+        response = await self._get(path, headers, params={"ticker": ticker, "min_ts": min_ts})
         response.raise_for_status()
         return response.json().get("fills", [])
 
